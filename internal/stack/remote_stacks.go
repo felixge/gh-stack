@@ -1,4 +1,4 @@
-package main
+package stack
 
 type RemoteStacks struct {
 	Stacks []*RemoteStack

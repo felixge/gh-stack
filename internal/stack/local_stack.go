@@ -1,4 +1,4 @@
-package main
+package stack
 
 type LocalStack struct {
 	MergeBase string
