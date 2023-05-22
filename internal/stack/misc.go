@@ -14,12 +14,12 @@ var _randomSeparator struct {
 func randomSeparator() (string, error) {
 	var err error
 	_randomSeparator.Do(func() {
-		buf := make([]byte, 32)
+		buf := make([]byte, 8)
 		_, err = rand.Read(buf)
 		if err != nil {
 			panic(err)
 		}
-		_randomSeparator.value = hex.EncodeToString(buf)
+		_randomSeparator.value = "|" + hex.EncodeToString(buf) + "|"
 	})
 	return _randomSeparator.value, err
 }

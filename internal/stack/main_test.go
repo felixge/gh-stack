@@ -35,10 +35,10 @@ func TestMain(m *testing.M) {
 
 var _localRemoteRepo struct {
 	sync.Once
-	config Config
+	ctx *Context
 }
 
-func localRemoteRepo(t *testing.T) Config {
+func localRemoteRepo(t *testing.T) *Context {
 	t.Helper()
 	_localRemoteRepo.Do(func() {
 		env, cleanup := tmpCmdEnv(t)
@@ -62,11 +62,22 @@ func localRemoteRepo(t *testing.T) Config {
 		local.Dir = filepath.Join(local.Dir, "local")
 
 		cmds = nil
-		cmds = append(cmds, createCommitCommands("C", "")...)
-		cmds = append(cmds, createCommitCommands("D", "Unique-D")...)
+		cmds = append(cmds, createCommitCommands("C", "uid-c")...)
+		cmds = append(cmds, []string{"git", "tag", "C"})
+		cmds = append(cmds, createCommitCommands("D", "uid-d")...)
+		cmds = append(cmds, []string{"git", "tag", "D"})
+		cmds = append(cmds, createCommitCommands("E", "uid-e")...)
+		cmds = append(cmds, createCommitCommands("F", "")...)
 		require.NoError(t, local.RunMulti(cmds...))
 
-		_localRemoteRepo.config = (Config{CmdEnv: local}).WithDefaults()
+		_, err = local.Run("git", "push", "origin", "C:refs/heads/gh-stack-commit-uid-c")
+		require.NoError(t, err)
+		_, err = local.Run("git", "push", "origin", "D:refs/heads/gh-stack-commit-uid-d")
+		require.NoError(t, err)
+
+		ctx, err := ContextOptions{Dir: local.Dir, Verbose: true}.NewContext()
+		require.NoError(t, err)
+		_localRemoteRepo.ctx = ctx
 	})
-	return _localRemoteRepo.config
+	return _localRemoteRepo.ctx
 }

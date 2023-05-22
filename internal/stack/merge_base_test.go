@@ -9,12 +9,12 @@ import (
 )
 
 func TestMergeBase(t *testing.T) {
-	config := localRemoteRepo(t)
+	ctx := localRemoteRepo(t)
 
-	ref, err := MergeBase(config.CmdEnv, "HEAD", "origin/main")
+	ref, err := MergeBase(ctx.cmd, "HEAD", "origin/main")
 	require.NoError(t, err)
 
-	commit, err := config.Run("git", "show", "-q", ref, "--pretty=format:%s")
+	commit, err := ctx.cmd.Run("git", "show", "-q", ref, "--pretty=format:%s")
 	require.NoError(t, err)
 	require.Equal(t, "B", commit)
 }

@@ -6,11 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/exp/slog"
 )
 
 type CmdEnv struct {
-	Dir string
-	Env []string
+	Dir    string
+	Env    []string
+	Logger *slog.Logger
 }
 
 func (e CmdEnv) RunMulti(cmds ...[]string) error {
@@ -23,9 +26,13 @@ func (e CmdEnv) RunMulti(cmds ...[]string) error {
 }
 
 func (e CmdEnv) Run(command ...string) (string, error) {
+	cmdS := strings.Join(command, " ")
+	if e.Logger != nil {
+		e.Logger.Debug("exec", "cmd", cmdS)
+	}
+
 	var buf bytes.Buffer
 	wrapErr := func(err error) error {
-		cmdS := strings.Join(command, " ")
 		if buf.String() == "" {
 			return fmt.Errorf("%s: %w", cmdS, err)
 		}

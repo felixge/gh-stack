@@ -49,6 +49,13 @@ type GitCommit struct {
 	Message string
 }
 
+func (g GitCommit) Branch() string {
+	if g.UID == "" {
+		return ""
+	}
+	return "gh-stack-commit-" + g.UID
+}
+
 func (g GitCommit) Oneline() string {
 	return strings.Split(g.Message, "\n")[0]
 }
@@ -66,4 +73,14 @@ func ParseCommitUID(input string) (string, error) {
 	}
 
 	return matches[0][1], nil
+}
+
+func gitRootDir(c *Context) (string, error) {
+	s, err := c.cmd.Run("git", "rev-parse", "--show-toplevel")
+	return strings.TrimSpace(s), err
+}
+
+func gitFetch(c *Context) error {
+	_, err := c.cmd.Run("git", "fetch", c.config.RemoteName)
+	return err
 }

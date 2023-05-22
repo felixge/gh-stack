@@ -12,8 +12,6 @@ func TestStatusStack(t *testing.T) {
 		config := localRemoteRepo(t)
 		var statusStack StatusStack
 		require.NoError(t, statusStack.Load(config))
-		for _, gc := range statusStack.LocalStack.Commits {
-			fmt.Printf("gc.Oneline(): %v\n", gc.Oneline())
-		}
+		fmt.Println(statusStack.String())
 	})
 }

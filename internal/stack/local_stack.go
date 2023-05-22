@@ -1,16 +1,11 @@
 package stack
 
 type LocalStack struct {
-	MergeBase string
-	Commits   []*GitCommit
+	Commits []*GitCommit
 }
 
 // Load populates the local stack according to the config.
-func (l *LocalStack) Load(c Config) error {
-	ref, err := MergeBase(c.CmdEnv, c.LocalRef, c.RemoteRef())
-	if err != nil {
-		return err
-	}
-	l.Commits, err = GitLog(c.CmdEnv, ref+".."+c.LocalRef)
+func (l *LocalStack) Load(c *Context) (err error) {
+	l.Commits, err = GitLog(c.cmd, c.mergeBase+".."+c.config.LocalHead)
 	return err
 }
