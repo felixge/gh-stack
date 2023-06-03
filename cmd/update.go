@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -41,15 +43,22 @@ This application is a tool to generate the needed files
 to quickly create a Cobra application.`,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		commits, err := gitLog(cmd.Context(), fmt.Sprintf("%s/%s..", updateFlags.Remote, updateFlags.BaseBranch))
+		ctx := cmd.Context()
+		baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.BaseBranch)
+		commits, err := localCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
 		if err != nil {
 			return err
 		}
-		for _, gc := range commits {
-			fmt.Printf("gc: %#v\n", gc)
+
+		if err := addStackCommitIDs(ctx, commits, cmd.OutOrStdout(), baseBranch); err != nil {
+			return err
 		}
 
-		remoteURL, err := gitRemoteURL(cmd.Context(), updateFlags.Remote)
+		for _, gc := range commits {
+			fmt.Printf("gc.StackCommitID: %v\n", gc.StackCommitID)
+		}
+
+		remoteURL, err := gitRemoteURL(ctx, updateFlags.Remote)
 		if err != nil {
 			return err
 		}
@@ -59,26 +68,16 @@ to quickly create a Cobra application.`,
 			return err
 		}
 
-		home, err := os.UserHomeDir()
+		ghClient, err := initGitHubClient(ctx)
 		if err != nil {
 			return err
 		}
 
-		githubConfig, err := loadGitHubConfig(filepath.Join(home, ".config", "gh", "hosts.yml"))
+		ref, err := getBaseRef(ctx, ghClient, owner, repo)
 		if err != nil {
 			return err
 		}
-
-		ctx := cmd.Context()
-		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubConfig.OAuthToken})
-		tc := oauth2.NewClient(ctx, ts)
-		ghClient := github.NewClient(tc)
-
-		ref, err := getBaseRef(cmd.Context(), ghClient, owner, repo)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("ref: %v\n", ref)
+		_ = ref
 		//
 		// fmt.Printf("owner: %v\n", owner)
 		// fmt.Printf("repo: %v\n", repo)
@@ -131,14 +130,26 @@ func loadGitHubConfig(filepath string) (*githubConfig, error) {
 	return &host, nil
 }
 
-func git(ctx context.Context, args ...string) (string, error) {
-	stdout := &bytes.Buffer{}
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Stdout = stdout
+type gitCommand struct {
+	Args  []string
+	Stdin io.Reader
+}
+
+func (g *gitCommand) Run(ctx context.Context) (string, error) {
+	out := &bytes.Buffer{}
+	cmd := exec.CommandContext(ctx, "git", g.Args...)
+	cmd.Stdin = g.Stdin
+	cmd.Stdout = out
+	cmd.Stderr = out
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return "", fmt.Errorf("git %s: %w", strings.Join(g.Args, " "), err)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return strings.TrimSpace(out.String()), nil
+
+}
+
+func git(ctx context.Context, args ...string) (string, error) {
+	return (&gitCommand{Args: args}).Run(ctx)
 }
 
 // gitRemoteURL returns the git remote URL for the given remote.
@@ -183,7 +194,7 @@ func randomSeparator() (string, error) {
 	return _randomSeparator.value, err
 }
 
-func gitLog(ctx context.Context, args ...string) ([]*gitCommit, error) {
+func localCommits(ctx context.Context, args ...string) ([]*localCommit, error) {
 	sep, err := randomSeparator()
 	if err != nil {
 		return nil, err
@@ -194,22 +205,145 @@ func gitLog(ctx context.Context, args ...string) ([]*gitCommit, error) {
 		return nil, err
 	}
 	parts := strings.Split(out, sep)
-	var commits []*gitCommit
+	var commits []*localCommit
 	for i := 0; i < len(parts)-1; i += 2 {
 		hash := strings.TrimSpace(parts[i])
-		msg := strings.TrimSpace(parts[i+1])
+		msg := parts[i+1]
 
-		commits = append(commits, &gitCommit{
-			Hash:    hash,
-			Message: msg,
+		stackCommitID, err := gitTrailerValue(ctx, msg, commitIDTrailerKey)
+		if err != nil {
+			return nil, err
+		}
+
+		commits = append(commits, &localCommit{
+			Hash:          hash,
+			Message:       msg,
+			StackCommitID: stackCommitID,
 		})
 	}
 	return commits, nil
 }
 
-type gitCommit struct {
+type localCommit struct {
 	// Hash is the git commit hash.
 	Hash string
 	// Message string.
 	Message string
+	// StackCommitID is the unique id of this commit used by gh-stack.
+	StackCommitID string
+}
+
+func initGitHubClient(ctx context.Context) (*github.Client, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	githubConfig, err := loadGitHubConfig(filepath.Join(home, ".config", "gh", "hosts.yml"))
+	if err != nil {
+		return nil, err
+	}
+
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubConfig.OAuthToken})
+	tc := oauth2.NewClient(ctx, ts)
+	return github.NewClient(tc), nil
+}
+
+func gitSetTrailers(ctx context.Context, msg string, trailers ...string) (string, error) {
+	cmd := gitCommand{
+		Args:  []string{"interpret-trailers"},
+		Stdin: strings.NewReader(msg),
+	}
+	for _, trailer := range trailers {
+		cmd.Args = append(cmd.Args, "--if-exists", "replace", "--trailer", trailer)
+	}
+	return cmd.Run(ctx)
+}
+
+func shortHash(hash string) string {
+	if len(hash) > 7 {
+		return hash[0:7]
+	}
+	return hash
+}
+
+const commitIDTrailerKey = "Stack-Commit-ID"
+
+func commitIDTrailer(commitHash string) string {
+	hash := sha1.Sum([]byte(commitHash))
+	return fmt.Sprintf("%s: %x", commitIDTrailerKey, hash)
+}
+
+func gitTrailerValue(ctx context.Context, msg, trailerKey string) (string, error) {
+	cmd := gitCommand{
+		Args:  []string{"interpret-trailers", "--parse"},
+		Stdin: strings.NewReader(msg),
+	}
+	trailers, err := cmd.Run(ctx)
+	if err != nil {
+		return "", err
+	}
+	var trailerValue string
+	for _, line := range strings.Split(trailers, "\n") {
+		parts := strings.Split(line, ": ")
+		if len(parts) == 2 && parts[0] == trailerKey {
+			trailerValue = parts[1]
+		}
+	}
+	return trailerValue, nil
+}
+
+func addStackCommitIDs(ctx context.Context, commits []*localCommit, out io.Writer, baseBranch string) error {
+	var rewordCommits []string
+	for _, gc := range commits {
+		if gc.StackCommitID != "" {
+			continue
+		}
+
+		gc.StackCommitID = commitIDTrailer(gc.Hash)
+		if updateFlags.DryRun {
+			fmt.Fprintf(
+				out,
+				"Reword commit %s to add \"%s\" trailer\n",
+				shortHash(gc.Hash),
+				gc.StackCommitID,
+			)
+		} else {
+			rewordCommits = append(rewordCommits, gc.Hash)
+		}
+	}
+
+	if len(rewordCommits) > 0 && !updateFlags.DryRun {
+		commitFile, err := os.CreateTemp("", "gh-stack")
+		if err != nil {
+			return err
+		}
+		defer commitFile.Close()
+		defer os.RemoveAll(commitFile.Name())
+
+		if _, err := commitFile.WriteString(strings.Join(rewordCommits, "\n")); err != nil {
+			return err
+		}
+
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		if _, err := git(
+			ctx,
+			// Disable git hooks for better performance. We're just appending a
+			// trailer to the message, no hook should want to prevent that.
+			"-c", "core.hooksPath=",
+			// Use the rebase-edit-todo command to select the rewordCommits for
+			// rewording.
+			"-c", fmt.Sprintf("sequence.editor=%s rebase-edit-todo %s", exe, commitFile.Name()),
+			// Use the rebase-add-trailer command to add the stack commit id
+			// trailers to those commits.
+			"-c", fmt.Sprintf("core.editor=%s rebase-add-trailer %s", exe, commitFile.Name()),
+			"rebase", "-i", baseBranch, "--autostash",
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
