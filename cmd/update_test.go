@@ -18,6 +18,13 @@ func TestParseGitHubRemoteURL(t *testing.T) {
 			wantErr:   false,
 		},
 		{
+			name:      "HTTPS URL WITHOUT .GIT",
+			remoteURL: "https://github.com/username/repo",
+			wantOwner: "username",
+			wantRepo:  "repo",
+			wantErr:   false,
+		},
+		{
 			name:      "SSH URL",
 			remoteURL: "git@github.com:username/repo.git",
 			wantOwner: "username",
