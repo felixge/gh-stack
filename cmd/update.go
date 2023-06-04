@@ -33,29 +33,20 @@ var updateFlags struct {
 
 // updateCmd represents the update command
 var updateCmd = &cobra.Command{
-	Use:   "update",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Use:          "update",
+	Short:        "Pushes the local commit stack and creates/updates PRs for it.",
+	Long:         ``,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		ctx := cmd.Context()
 		baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.BaseBranch)
-		commits, err := localCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
+		localCommits, err := gitLocalCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
 		if err != nil {
 			return err
 		}
 
-		if err := addStackCommitIDs(ctx, commits, cmd.OutOrStdout(), baseBranch); err != nil {
+		if err := addStackCommitIDs(ctx, localCommits, cmd.OutOrStdout(), baseBranch); err != nil {
 			return err
-		}
-
-		for _, gc := range commits {
-			fmt.Printf("gc.StackCommitID: %v\n", gc.StackCommitID)
 		}
 
 		remoteURL, err := gitRemoteURL(ctx, updateFlags.Remote)
@@ -68,20 +59,100 @@ to quickly create a Cobra application.`,
 			return err
 		}
 
-		ghClient, err := initGitHubClient(ctx)
+		gh, err := initGitHubClient(ctx)
 		if err != nil {
 			return err
 		}
 
-		ref, err := getBaseRef(ctx, ghClient, owner, repo)
+		prs, err := githubFindPullRequests(ctx, gh, owner, repo, localCommits)
 		if err != nil {
 			return err
 		}
-		_ = ref
-		//
-		// fmt.Printf("owner: %v\n", owner)
-		// fmt.Printf("repo: %v\n", repo)
+
+		base := updateFlags.BaseBranch
+		for i := len(localCommits) - 1; i >= 0; i-- {
+			commit := localCommits[i]
+			pr, ok := prs[commit.Hash]
+			// if !ok {
+			// 	if updateFlags.DryRun {
+			// 		cmd.Printf("create PR for commit %s\n", commit.Hash)
+			// 	}
+			// } else {
+
+			// Force-push branch if needed
+			if !ok || pr.Head.GetSHA() != commit.Hash {
+				remoteBranch := stackCommitIDBranch(commit.StackCommitID)
+				if updateFlags.DryRun {
+					cmd.Printf("push commit %s to branch %s of remote %s\n", shortHash(commit.Hash), remoteBranch, updateFlags.Remote)
+				} else if err := gitForcePush(ctx, updateFlags.Remote, commit.Hash, remoteBranch); err != nil {
+					return err
+				}
+			}
+
+			// Create or update PR if needed
+			if !ok {
+				if updateFlags.DryRun {
+					cmd.Printf("create PR for commit %s\n", commit.Hash)
+				}
+			} else {
+				if updateFlags.DryRun {
+					cmd.Printf("update PR for commit %s\n", shortHash(commit.Hash))
+				}
+			}
+
+			_ = pr
+			_ = base
+		}
+
+		// for k, pr := range prs {
+		// 	fmt.Printf("%s: %v\n", k, pr.Head.GetRef())
+		// }
 		return nil
+
+		// 	base := updateFlags.BaseBranch
+		// 	for i := len(commits) - 1; i >= 0; i-- {
+		// 		remoteBranch := stackCommitIDBranch(commit.StackCommitID)
+		// 		if updateFlags.DryRun {
+		// 			cmd.Printf("push commit %s to branch %s of remote %s\n", shortHash(commit.Hash), remoteBranch, updateFlags.Remote)
+		// 		} else if _, err := git(ctx, "push", "-f", updateFlags.Remote, fmt.Sprintf("%s:refs/heads/%s", commit.Hash, remoteBranch)); err != nil {
+		// 			return err
+		// 		}
+		//
+		// 		pr, err := findOpenPR(ctx, ghClient, owner, repo, remoteBranch)
+		// 		if err == errPRNotFound {
+		// 			cmd.Printf("create PR %q for commit %s\n", commit.Oneline())
+		// 		} else if err != nil {
+		// 			return err
+		// 		} else if pr.Head.GetSHA() == commit.Hash {
+		// 			cmd.Printf("update PR #%d %s\n", pr.GetNumber())
+		// 		}
+		// 		_ = base
+		//
+		// 		// pr := PullRequest{
+		// 		// 	Title: commit.Oneline(),
+		// 		// 	Head:  remoteBranch,
+		// 		// 	Base:  base,
+		// 		// 	Body:  commit.Message,
+		// 		// 	Owner: owner,
+		// 		// 	Repo:  repo,
+		// 		// }
+		// 		// pull, err := createOrUpdatePR(ctx, ghClient, pr)
+		// 		// if err != nil {
+		// 		// 	return err
+		// 		// }
+		// 		// fmt.Printf("pull.GetHTMLURL(): %v\n", pull.GetHTMLURL())
+		//
+		// 		base = remoteBranch
+		// 	}
+		// 	// ref, err := getBaseRef(ctx, ghClient, owner, repo)
+		// 	// if err != nil {
+		// 	// 	return err
+		// 	// }
+		// 	// _ = ref
+		// 	//
+		// 	// fmt.Printf("owner: %v\n", owner)
+		// 	// fmt.Printf("repo: %v\n", repo)
+		// 	return nil
 	},
 }
 
@@ -157,6 +228,11 @@ func gitRemoteURL(ctx context.Context, remote string) (string, error) {
 	return git(ctx, "config", "--get", fmt.Sprintf("remote.%s.url", remote))
 }
 
+func gitForcePush(ctx context.Context, remote, localHash, remoteBranch string) error {
+	_, err := git(ctx, "push", "-f", remote, fmt.Sprintf("%s:refs/heads/%s", localHash, remoteBranch))
+	return err
+}
+
 // parseGitHubRemoteURL returns the owner and repo for a remoteURL if it
 // follows one of the formats below. GitHub Enterprise is not supported (yet).
 //
@@ -194,7 +270,7 @@ func randomSeparator() (string, error) {
 	return _randomSeparator.value, err
 }
 
-func localCommits(ctx context.Context, args ...string) ([]*localCommit, error) {
+func gitLocalCommits(ctx context.Context, args ...string) ([]*localCommit, error) {
 	sep, err := randomSeparator()
 	if err != nil {
 		return nil, err
@@ -233,6 +309,11 @@ type localCommit struct {
 	StackCommitID string
 }
 
+func (c *localCommit) Oneline() string {
+	line, _, _ := strings.Cut(c.Message, "\n")
+	return line
+}
+
 func initGitHubClient(ctx context.Context) (*github.Client, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -269,9 +350,12 @@ func shortHash(hash string) string {
 
 const commitIDTrailerKey = "Stack-Commit-ID"
 
-func commitIDTrailer(commitHash string) string {
-	hash := sha1.Sum([]byte(commitHash))
-	return fmt.Sprintf("%s: %x", commitIDTrailerKey, hash)
+func stackCommitIDTrailer(commitHash string) string {
+	return fmt.Sprintf("%s: %s", commitIDTrailerKey, stackCommitIDValue(commitHash))
+}
+
+func stackCommitIDValue(commitHash string) string {
+	return fmt.Sprintf("%x", sha1.Sum([]byte(commitHash)))
 }
 
 func gitTrailerValue(ctx context.Context, msg, trailerKey string) (string, error) {
@@ -295,21 +379,21 @@ func gitTrailerValue(ctx context.Context, msg, trailerKey string) (string, error
 
 func addStackCommitIDs(ctx context.Context, commits []*localCommit, out io.Writer, baseBranch string) error {
 	var rewordCommits []string
-	for _, gc := range commits {
-		if gc.StackCommitID != "" {
+	for _, commit := range commits {
+		if commit.StackCommitID != "" {
 			continue
 		}
 
-		gc.StackCommitID = commitIDTrailer(gc.Hash)
+		commit.StackCommitID = stackCommitIDValue(commit.Hash)
 		if updateFlags.DryRun {
 			fmt.Fprintf(
 				out,
-				"Reword commit %s to add \"%s\" trailer\n",
-				shortHash(gc.Hash),
-				gc.StackCommitID,
+				"reword commit %s to add \"%s\" trailer\n",
+				shortHash(commit.Hash),
+				commit.StackCommitID,
 			)
 		} else {
-			rewordCommits = append(rewordCommits, gc.Hash)
+			rewordCommits = append(rewordCommits, commit.Hash)
 		}
 	}
 
@@ -346,4 +430,8 @@ func addStackCommitIDs(ctx context.Context, commits []*localCommit, out io.Write
 		}
 	}
 	return nil
+}
+
+func stackCommitIDBranch(stackCommitID string) string {
+	return fmt.Sprintf("gh-stack/%s", stackCommitID)
 }
