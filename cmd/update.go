@@ -16,10 +16,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/trace"
 	"strings"
 	"sync"
+	"text/template"
 
 	"github.com/google/go-github/v52/github"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/spf13/cobra"
 	"golang.org/x/oauth2"
 	"gopkg.in/yaml.v3"
@@ -31,129 +34,138 @@ var updateFlags struct {
 	BaseBranch string
 }
 
-// updateCmd represents the update command
 var updateCmd = &cobra.Command{
 	Use:          "update",
 	Short:        "Pushes the local commit stack and creates/updates PRs for it.",
 	Long:         ``,
 	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, _ []string) error {
-		ctx := cmd.Context()
-		baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.BaseBranch)
-		localCommits, err := gitLocalCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
-		if err != nil {
-			return err
+	RunE:         runUpdate,
+}
+
+func runUpdate(cmd *cobra.Command, _ []string) error {
+	ctx, task := trace.NewTask(cmd.Context(), "runUpdate")
+	defer task.End()
+
+	baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.BaseBranch)
+	localCommits, err := gitLocalCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
+	if err != nil {
+		return err
+	}
+
+	dispatch := func(msg string, fn func() error) error {
+		if updateFlags.DryRun || globalFlags.Verbose {
+			cmd.Println(msg)
 		}
-
-		if err := addStackCommitIDs(ctx, localCommits, cmd.OutOrStdout(), baseBranch); err != nil {
-			return err
+		if !updateFlags.DryRun {
+			return fn()
 		}
-
-		remoteURL, err := gitRemoteURL(ctx, updateFlags.Remote)
-		if err != nil {
-			return err
-		}
-
-		owner, repo, err := parseGitHubRemoteURL(remoteURL)
-		if err != nil {
-			return err
-		}
-
-		gh, err := initGitHubClient(ctx)
-		if err != nil {
-			return err
-		}
-
-		prs, err := githubFindPullRequests(ctx, gh, owner, repo, localCommits)
-		if err != nil {
-			return err
-		}
-
-		base := updateFlags.BaseBranch
-		for i := len(localCommits) - 1; i >= 0; i-- {
-			commit := localCommits[i]
-			pr, ok := prs[commit.Hash]
-			// if !ok {
-			// 	if updateFlags.DryRun {
-			// 		cmd.Printf("create PR for commit %s\n", commit.Hash)
-			// 	}
-			// } else {
-
-			// Force-push branch if needed
-			if !ok || pr.Head.GetSHA() != commit.Hash {
-				remoteBranch := stackCommitIDBranch(commit.StackCommitID)
-				if updateFlags.DryRun {
-					cmd.Printf("push commit %s to branch %s of remote %s\n", shortHash(commit.Hash), remoteBranch, updateFlags.Remote)
-				} else if err := gitForcePush(ctx, updateFlags.Remote, commit.Hash, remoteBranch); err != nil {
-					return err
-				}
-			}
-
-			// Create or update PR if needed
-			if !ok {
-				if updateFlags.DryRun {
-					cmd.Printf("create PR for commit %s\n", commit.Hash)
-				}
-			} else {
-				if updateFlags.DryRun {
-					cmd.Printf("update PR for commit %s\n", shortHash(commit.Hash))
-				}
-			}
-
-			_ = pr
-			_ = base
-		}
-
-		// for k, pr := range prs {
-		// 	fmt.Printf("%s: %v\n", k, pr.Head.GetRef())
-		// }
 		return nil
+	}
 
-		// 	base := updateFlags.BaseBranch
-		// 	for i := len(commits) - 1; i >= 0; i-- {
-		// 		remoteBranch := stackCommitIDBranch(commit.StackCommitID)
-		// 		if updateFlags.DryRun {
-		// 			cmd.Printf("push commit %s to branch %s of remote %s\n", shortHash(commit.Hash), remoteBranch, updateFlags.Remote)
-		// 		} else if _, err := git(ctx, "push", "-f", updateFlags.Remote, fmt.Sprintf("%s:refs/heads/%s", commit.Hash, remoteBranch)); err != nil {
-		// 			return err
-		// 		}
-		//
-		// 		pr, err := findOpenPR(ctx, ghClient, owner, repo, remoteBranch)
-		// 		if err == errPRNotFound {
-		// 			cmd.Printf("create PR %q for commit %s\n", commit.Oneline())
-		// 		} else if err != nil {
-		// 			return err
-		// 		} else if pr.Head.GetSHA() == commit.Hash {
-		// 			cmd.Printf("update PR #%d %s\n", pr.GetNumber())
-		// 		}
-		// 		_ = base
-		//
-		// 		// pr := PullRequest{
-		// 		// 	Title: commit.Oneline(),
-		// 		// 	Head:  remoteBranch,
-		// 		// 	Base:  base,
-		// 		// 	Body:  commit.Message,
-		// 		// 	Owner: owner,
-		// 		// 	Repo:  repo,
-		// 		// }
-		// 		// pull, err := createOrUpdatePR(ctx, ghClient, pr)
-		// 		// if err != nil {
-		// 		// 	return err
-		// 		// }
-		// 		// fmt.Printf("pull.GetHTMLURL(): %v\n", pull.GetHTMLURL())
-		//
-		// 		base = remoteBranch
-		// 	}
-		// 	// ref, err := getBaseRef(ctx, ghClient, owner, repo)
-		// 	// if err != nil {
-		// 	// 	return err
-		// 	// }
-		// 	// _ = ref
-		// 	//
-		// 	// fmt.Printf("owner: %v\n", owner)
-		// 	// fmt.Printf("repo: %v\n", repo)
-		// 	return nil
-	},
+	localCommits, err = addStackCommitIDs(ctx, localCommits, dispatch, baseBranch)
+	if err != nil {
+		return err
+	}
+
+	remoteURL, err := gitRemoteURL(ctx, updateFlags.Remote)
+	if err != nil {
+		return err
+	}
+
+	owner, repo, err := parseGitHubRemoteURL(remoteURL)
+	if err != nil {
+		return err
+	}
+
+	gh, err := initGitHubClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	prs, err := githubFindPullRequests(ctx, gh, owner, repo, localCommits)
+	if err != nil {
+		return err
+	}
+
+	if err := gitForcePushCommits(ctx, updateFlags.Remote, localCommits, prs, dispatch); err != nil {
+		return err
+	}
+
+	// base := updateFlags.BaseBranch
+	// for i := len(localCommits) - 1; i >= 0; i-- {
+	// 	commit := localCommits[i]
+	// 	pr, ok := prs[commit.Hash]
+	// 	remoteBranch := stackCommitIDBranch(commit.StackCommitID)
+	//
+	// 	// Force-push branch if needed
+	// 	if !ok || pr.Head.GetSHA() != commit.Hash {
+	// 		if err := dispatch(fmt.Sprintf(
+	// 			"force push commit to %s to %s branch %s",
+	// 			shortHash(commit.Hash),
+	// 			updateFlags.Remote,
+	// 			remoteBranch,
+	// 		), func() error {
+	// 			return gitForcePush(ctx, updateFlags.Remote, commit.Hash, remoteBranch)
+	// 		}); err != nil {
+	// 			return err
+	// 		}
+	// 	}
+	//
+	// 	var prData = struct {
+	// 		Title string
+	// 		Body  string
+	// 		Base  string
+	// 		Head  string
+	// 	}{commit.Oneline(), commit.Message, base, remoteBranch}
+	//
+	// 	buf := &bytes.Buffer{}
+	// 	if err := prTemplate.Execute(buf, &prData); err != nil {
+	// 		return err
+	// 	}
+	// 	prData.Body = buf.String()
+	//
+	// 	// Create or update PR if needed
+	// 	if !ok {
+	// 		if err := dispatch(
+	// 			fmt.Sprintf("create PR for commit %s against %s branch %s", commit.Hash, updateFlags.Remote, base),
+	// 			func() error {
+	// 				newPR := &github.NewPullRequest{
+	// 					Title: github.String(prData.Title),
+	// 					Head:  github.String(prData.Head),
+	// 					Base:  github.String(prData.Base),
+	// 					Body:  github.String(prData.Body),
+	// 				}
+	// 				_, _, err := gh.PullRequests.Create(ctx, owner, repo, newPR)
+	// 				if err != nil {
+	// 					return fmt.Errorf("create PR: %w", err)
+	// 				}
+	// 				return nil
+	// 			}); err != nil {
+	// 			return err
+	// 		}
+	// 	} else if pr.Head.GetSHA() != commit.Hash ||
+	// 		pr.GetTitle() != prData.Title ||
+	// 		pr.GetBody() != prData.Body ||
+	// 		pr.GetBase().GetRef() != prData.Base {
+	// 		if err := dispatch(
+	// 			fmt.Sprintf("edit PR for commit %s", shortHash(commit.Hash)),
+	// 			func() error {
+	// 				pr.Title = &prData.Title
+	// 				pr.Body = &prData.Body
+	// 				pr.Base.Ref = &prData.Base
+	// 				_, _, err := gh.PullRequests.Edit(ctx, owner, repo, pr.GetNumber(), pr)
+	// 				if err != nil {
+	// 					return fmt.Errorf("edit PR: %w", err)
+	// 				}
+	// 				return nil
+	// 			}); err != nil {
+	// 			return err
+	// 		}
+	// 	}
+	//
+	// 	base = remoteBranch
+	// }
+	return nil
 }
 
 func init() {
@@ -229,6 +241,9 @@ func gitRemoteURL(ctx context.Context, remote string) (string, error) {
 }
 
 func gitForcePush(ctx context.Context, remote, localHash, remoteBranch string) error {
+	ctx, task := trace.NewTask(ctx, "gitForcePush")
+	defer task.End()
+
 	_, err := git(ctx, "push", "-f", remote, fmt.Sprintf("%s:refs/heads/%s", localHash, remoteBranch))
 	return err
 }
@@ -271,6 +286,9 @@ func randomSeparator() (string, error) {
 }
 
 func gitLocalCommits(ctx context.Context, args ...string) ([]*localCommit, error) {
+	ctx, task := trace.NewTask(ctx, "gitLocalCommits")
+	defer task.End()
+
 	sep, err := randomSeparator()
 	if err != nil {
 		return nil, err
@@ -281,23 +299,27 @@ func gitLocalCommits(ctx context.Context, args ...string) ([]*localCommit, error
 		return nil, err
 	}
 	parts := strings.Split(out, sep)
-	var commits []*localCommit
+
+	p := pool.NewWithResults[*localCommit]().WithErrors()
+
 	for i := 0; i < len(parts)-1; i += 2 {
-		hash := strings.TrimSpace(parts[i])
-		msg := parts[i+1]
+		i := i
+		p.Go(func() (*localCommit, error) {
+			hash := strings.TrimSpace(parts[i])
+			msg := parts[i+1]
 
-		stackCommitID, err := gitTrailerValue(ctx, msg, commitIDTrailerKey)
-		if err != nil {
-			return nil, err
-		}
-
-		commits = append(commits, &localCommit{
-			Hash:          hash,
-			Message:       msg,
-			StackCommitID: stackCommitID,
+			stackCommitID, err := gitTrailerValue(ctx, msg, commitIDTrailerKey)
+			if err != nil {
+				return nil, err
+			}
+			return &localCommit{
+				Hash:          hash,
+				Message:       msg,
+				StackCommitID: stackCommitID,
+			}, nil
 		})
 	}
-	return commits, nil
+	return p.Wait()
 }
 
 type localCommit struct {
@@ -359,6 +381,9 @@ func stackCommitIDValue(commitHash string) string {
 }
 
 func gitTrailerValue(ctx context.Context, msg, trailerKey string) (string, error) {
+	ctx, task := trace.NewTask(ctx, "gitTrailerValue")
+	defer task.End()
+
 	cmd := gitCommand{
 		Args:  []string{"interpret-trailers", "--parse"},
 		Stdin: strings.NewReader(msg),
@@ -377,7 +402,15 @@ func gitTrailerValue(ctx context.Context, msg, trailerKey string) (string, error
 	return trailerValue, nil
 }
 
-func addStackCommitIDs(ctx context.Context, commits []*localCommit, out io.Writer, baseBranch string) error {
+func addStackCommitIDs(
+	ctx context.Context,
+	commits []*localCommit,
+	dispatch func(string, func() error) error,
+	baseBranch string,
+) ([]*localCommit, error) {
+	ctx, task := trace.NewTask(ctx, "addStackCommitIDs")
+	defer task.End()
+
 	var rewordCommits []string
 	for _, commit := range commits {
 		if commit.StackCommitID != "" {
@@ -385,53 +418,100 @@ func addStackCommitIDs(ctx context.Context, commits []*localCommit, out io.Write
 		}
 
 		commit.StackCommitID = stackCommitIDValue(commit.Hash)
-		if updateFlags.DryRun {
-			fmt.Fprintf(
-				out,
-				"reword commit %s to add \"%s\" trailer\n",
-				shortHash(commit.Hash),
-				commit.StackCommitID,
-			)
-		} else {
+		dispatch(fmt.Sprintf(
+			"reword commit %s to add %q trailer",
+			shortHash(commit.Hash),
+			stackCommitIDTrailer(commit.Hash),
+		), func() error {
 			rewordCommits = append(rewordCommits, commit.Hash)
-		}
+			return nil
+		})
 	}
 
-	if len(rewordCommits) > 0 && !updateFlags.DryRun {
-		commitFile, err := os.CreateTemp("", "gh-stack")
-		if err != nil {
-			return err
-		}
-		defer commitFile.Close()
-		defer os.RemoveAll(commitFile.Name())
-
-		if _, err := commitFile.WriteString(strings.Join(rewordCommits, "\n")); err != nil {
-			return err
-		}
-
-		exe, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		if _, err := git(
-			ctx,
-			// Disable git hooks for better performance. We're just appending a
-			// trailer to the message, no hook should want to prevent that.
-			"-c", "core.hooksPath=",
-			// Use the rebase-edit-todo command to select the rewordCommits for
-			// rewording.
-			"-c", fmt.Sprintf("sequence.editor=%s rebase-edit-todo %s", exe, commitFile.Name()),
-			// Use the rebase-add-trailer command to add the stack commit id
-			// trailers to those commits.
-			"-c", fmt.Sprintf("core.editor=%s rebase-add-trailer %s", exe, commitFile.Name()),
-			"rebase", "-i", baseBranch, "--autostash",
-		); err != nil {
-			return err
-		}
+	if len(rewordCommits) == 0 {
+		return commits, nil
 	}
-	return nil
+
+	commitFile, err := os.CreateTemp("", "gh-stack")
+	if err != nil {
+		return nil, err
+	}
+	defer commitFile.Close()
+	defer os.RemoveAll(commitFile.Name())
+
+	if _, err := commitFile.WriteString(strings.Join(rewordCommits, "\n")); err != nil {
+		return nil, err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = git(
+		ctx,
+		// Disable git hooks for better performance. We're just appending a
+		// trailer to the message, no hook should want to prevent that.
+		"-c", "core.hooksPath=",
+		// Use the rebase-edit-todo command to select the rewordCommits for
+		// rewording.
+		"-c", fmt.Sprintf("sequence.editor=%s rebase-edit-todo %s", exe, commitFile.Name()),
+		// Use the rebase-add-trailer command to add the stack commit id
+		// trailers to those commits.
+		"-c", fmt.Sprintf("core.editor=%s rebase-add-trailer %s", exe, commitFile.Name()),
+		"rebase", "-i", baseBranch, "--autostash",
+	); err != nil {
+		return nil, err
+	}
+
+	// Reload commit history after rewording
+	return gitLocalCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
 }
 
 func stackCommitIDBranch(stackCommitID string) string {
 	return fmt.Sprintf("gh-stack/%s", stackCommitID)
 }
+
+func gitForcePushCommits(
+	ctx context.Context,
+	remote string,
+	localCommits []*localCommit,
+	prs map[string]*github.PullRequest,
+	dispatch func(string, func() error) error,
+) error {
+	ctx, task := trace.NewTask(ctx, "gitForcePushCommits")
+	defer task.End()
+
+	var branches []string
+	for _, commit := range localCommits {
+		pr, ok := prs[commit.Hash]
+		if ok && pr.Head.GetSHA() == commit.Hash {
+			continue
+		}
+
+		remoteBranch := stackCommitIDBranch(commit.StackCommitID)
+		dispatch(fmt.Sprintf(
+			"force push commit to %s to %s branch %s",
+			shortHash(commit.Hash),
+			remote,
+			remoteBranch,
+		), func() error {
+			branches = append(branches, fmt.Sprintf("%s:refs/heads/%s", commit.Hash, remoteBranch))
+			return nil
+		})
+	}
+
+	if len(branches) == 0 {
+		return nil
+	}
+	_, err := git(ctx, append([]string{"push", "-f", remote}, branches...)...)
+	return err
+}
+
+var prTemplate = template.Must(template.New("foo").Parse(`{{.Body}}
+
+---
+
+
+This stacked PR was created using [gh-stack](https://github.com/felixge/gh-stack).
+`))

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/trace"
 	"time"
 
 	"github.com/google/go-github/v52/github"
@@ -72,6 +73,9 @@ func githubFindPullRequests(
 	owner string,
 	repo string,
 	commits []*localCommit) (map[string]*github.PullRequest, error) {
+	ctx, task := trace.NewTask(ctx, "githubFindPullRequests")
+	defer task.End()
+
 	type result struct {
 		Commit *localCommit
 		PR     *github.PullRequest
@@ -83,6 +87,9 @@ func githubFindPullRequests(
 		p.Go(func() (result, error) {
 			remoteBranch := stackCommitIDBranch(commit.StackCommitID)
 			pr, err := findOpenPR(ctx, gh, owner, repo, remoteBranch)
+			if err == errPRNotFound {
+				err = nil
+			}
 			return result{PR: pr, Commit: commit}, err
 		})
 	}
@@ -92,12 +99,17 @@ func githubFindPullRequests(
 	}
 	m := make(map[string]*github.PullRequest)
 	for _, result := range results {
-		m[result.Commit.Hash] = result.PR
+		if result.PR != nil {
+			m[result.Commit.Hash] = result.PR
+		}
 	}
 	return m, nil
 }
 
 func findOpenPR(ctx context.Context, gh *github.Client, owner, repo, head string) (*github.PullRequest, error) {
+	ctx, task := trace.NewTask(ctx, "findOpenPR")
+	defer task.End()
+
 	pulls, _, err := gh.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
 		State: "open",
 		Head:  fmt.Sprintf("%s:%s", owner, head),

@@ -23,12 +23,19 @@ package cmd
 
 import (
 	"os"
+	"runtime/trace"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
-var cfgFile string
+var globalFlags struct {
+	Trace   string
+	Config  string
+	Verbose bool
+}
+
+var stopTrace = func() error { return nil }
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -40,6 +47,25 @@ examples and usage of using your application. For example:
 Cobra is a CLI library for Go that empowers applications.
 This application is a tool to generate the needed files
 to quickly create a Cobra application.`,
+	PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+		if globalFlags.Trace != "" {
+			file, err := os.Create(globalFlags.Trace)
+			if err != nil {
+				return err
+			} else if err := trace.Start(file); err != nil {
+				file.Close()
+				return err
+			}
+			stopTrace = func() error {
+				trace.Stop()
+				return file.Close()
+			}
+		}
+		return nil
+	},
+	PersistentPostRunE: func(_ *cobra.Command, _ []string) error {
+		return stopTrace()
+	},
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },
@@ -61,18 +87,16 @@ func init() {
 	// Cobra supports persistent flags, which, if defined here,
 	// will be global for your application.
 
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.gh-stack.yaml)")
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	rootCmd.PersistentFlags().StringVar(&globalFlags.Config, "config", "", "config file (default is $HOME/.gh-stack.yaml)")
+	rootCmd.PersistentFlags().StringVar(&globalFlags.Trace, "trace", "", "record a go execution trace to the given file")
+	rootCmd.PersistentFlags().BoolVarP(&globalFlags.Verbose, "verbose", "v", false, "output the steps the command is taking")
 }
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
-	if cfgFile != "" {
+	if globalFlags.Config != "" {
 		// Use config file from the flag.
-		viper.SetConfigFile(cfgFile)
+		viper.SetConfigFile(globalFlags.Config)
 	} else {
 		// Find home directory.
 		home, err := os.UserHomeDir()
