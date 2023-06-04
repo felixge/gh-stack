@@ -50,7 +50,7 @@ func addCommitIDTrailer(ctx context.Context, commitFile string, commit string) e
 		return err
 	}
 
-	newMsg, err := gitSetTrailers(ctx, string(oldMsg), commitIDTrailer(commit))
+	newMsg, err := gitSetTrailers(ctx, string(oldMsg), stackCommitIDTrailer(commit))
 	if err != nil {
 		return err
 	}
