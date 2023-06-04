@@ -5,11 +5,13 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/google/go-github/v52/github"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/spf13/cobra"
 	"golang.org/x/oauth2"
 )
@@ -31,18 +33,18 @@ to quickly create a Cobra application.`,
 		)
 		tc := oauth2.NewClient(ctx, ts)
 
-		client := github.NewClient(tc)
+		gh := github.NewClient(tc)
 
 		pr := PullRequest{
 			Title: fmt.Sprintf("Time: %s", time.Now().Format(time.RFC3339)),
-			Head:  "foo",
+			Head:  "felixge:feature",
 			Base:  "main",
 			Body:  "body *is* cool",
-			Owner: "felixge",
+			Owner: "debuggable",
 			Repo:  "gh-stack-test",
 		}
 
-		pull, err := createOrUpdatePR(ctx, client, pr)
+		pull, err := createOrUpdatePR(ctx, gh, pr)
 		if err != nil {
 			return err
 		}
@@ -62,15 +64,64 @@ type PullRequest struct {
 	Repo  string
 }
 
-func createOrUpdatePR(ctx context.Context, client *github.Client, pr PullRequest) (*github.PullRequest, error) {
+var errPRNotFound = errors.New("pull request not found")
+
+func githubFindPullRequests(
+	ctx context.Context,
+	gh *github.Client,
+	owner string,
+	repo string,
+	commits []*localCommit) (map[string]*github.PullRequest, error) {
+	type result struct {
+		Commit *localCommit
+		PR     *github.PullRequest
+	}
+
+	p := pool.NewWithResults[result]().WithMaxGoroutines(10).WithErrors()
+	for _, commit := range commits {
+		commit := commit
+		p.Go(func() (result, error) {
+			remoteBranch := stackCommitIDBranch(commit.StackCommitID)
+			pr, err := findOpenPR(ctx, gh, owner, repo, remoteBranch)
+			return result{PR: pr, Commit: commit}, err
+		})
+	}
+	results, err := p.Wait()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]*github.PullRequest)
+	for _, result := range results {
+		m[result.Commit.Hash] = result.PR
+	}
+	return m, nil
+}
+
+func findOpenPR(ctx context.Context, gh *github.Client, owner, repo, head string) (*github.PullRequest, error) {
+	pulls, _, err := gh.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
+		State: "open",
+		Head:  fmt.Sprintf("%s:%s", owner, head),
+	})
+	if err != nil {
+		// Handle error
+		return nil, fmt.Errorf("list PRs: %w", err)
+	} else if len(pulls) == 0 {
+		return nil, errPRNotFound
+	} else if len(pulls) > 1 {
+		return nil, fmt.Errorf("found more than one PR")
+	}
+	return pulls[0], nil
+}
+
+func createOrUpdatePR(ctx context.Context, gh *github.Client, pr PullRequest) (*github.PullRequest, error) {
 	// Find existing PR for the same head (branch)
-	pulls, _, err := client.PullRequests.List(ctx, pr.Owner, pr.Repo, &github.PullRequestListOptions{
+	pulls, _, err := gh.PullRequests.List(ctx, pr.Owner, pr.Repo, &github.PullRequestListOptions{
 		State: "open",
 		Head:  fmt.Sprintf("%s:%s", pr.Owner, pr.Head),
 	})
 	if err != nil {
 		// Handle error
-		return nil, err
+		return nil, fmt.Errorf("list PRs: %w", err)
 	}
 
 	// Create new PR if there isn't an existing one to update
@@ -81,7 +132,10 @@ func createOrUpdatePR(ctx context.Context, client *github.Client, pr PullRequest
 			Base:  github.String(pr.Base),
 			Body:  github.String(pr.Body),
 		}
-		pull, _, err := client.PullRequests.Create(ctx, pr.Owner, pr.Repo, newPR)
+		pull, _, err := gh.PullRequests.Create(ctx, pr.Owner, pr.Repo, newPR)
+		if err != nil {
+			return nil, fmt.Errorf("create PR: %w", err)
+		}
 		return pull, err
 	}
 
@@ -96,7 +150,10 @@ func createOrUpdatePR(ctx context.Context, client *github.Client, pr PullRequest
 	pull.Title = github.String(pr.Title)
 	pull.Body = github.String(pr.Body)
 	pull.Base.Ref = github.String(pr.Base)
-	pull, _, err = client.PullRequests.Edit(ctx, pr.Owner, pr.Repo, pull.GetNumber(), pull)
+	pull, _, err = gh.PullRequests.Edit(ctx, pr.Owner, pr.Repo, pull.GetNumber(), pull)
+	if err != nil {
+		return nil, fmt.Errorf("edit PR: %w", err)
+	}
 	return pull, err
 }
 
