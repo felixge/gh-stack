@@ -28,18 +28,25 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var updateFlags struct {
-	DryRun     bool
-	Remote     string
-	BaseBranch string
-}
-
 var updateCmd = &cobra.Command{
 	Use:          "update",
 	Short:        "Pushes the local commit stack and creates/updates PRs for it.",
 	Long:         ``,
 	SilenceUsage: true,
 	RunE:         runUpdate,
+}
+
+var updateFlags struct {
+	DryRun     bool
+	Remote     string
+	BaseBranch string
+}
+
+func init() {
+	rootCmd.AddCommand(updateCmd)
+	updateCmd.Flags().BoolVarP(&updateFlags.DryRun, "dry-run", "n", false, "Output the steps the command will take without executing them.")
+	updateCmd.Flags().StringVarP(&updateFlags.Remote, "remote", "r", "origin", "Name of the git remote to interact with.")
+	updateCmd.Flags().StringVarP(&updateFlags.BaseBranch, "base", "b", "main", "Name of the base branch to target with pull requests.")
 }
 
 func runUpdate(cmd *cobra.Command, _ []string) error {
@@ -91,25 +98,16 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	if err := githubCreateAndEditPRs(ctx, gh, updateFlags.Remote, owner, repo, localCommits, prs, dispatch); err != nil {
+		return err
+	}
+
 	// base := updateFlags.BaseBranch
 	// for i := len(localCommits) - 1; i >= 0; i-- {
 	// 	commit := localCommits[i]
 	// 	pr, ok := prs[commit.Hash]
 	// 	remoteBranch := stackCommitIDBranch(commit.StackCommitID)
 	//
-	// 	// Force-push branch if needed
-	// 	if !ok || pr.Head.GetSHA() != commit.Hash {
-	// 		if err := dispatch(fmt.Sprintf(
-	// 			"force push commit to %s to %s branch %s",
-	// 			shortHash(commit.Hash),
-	// 			updateFlags.Remote,
-	// 			remoteBranch,
-	// 		), func() error {
-	// 			return gitForcePush(ctx, updateFlags.Remote, commit.Hash, remoteBranch)
-	// 		}); err != nil {
-	// 			return err
-	// 		}
-	// 	}
 	//
 	// 	var prData = struct {
 	// 		Title string
@@ -166,22 +164,6 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 	// 	base = remoteBranch
 	// }
 	return nil
-}
-
-func init() {
-	rootCmd.AddCommand(updateCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// updateCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	updateCmd.Flags().BoolVarP(&updateFlags.DryRun, "dry-run", "n", false, "Output the steps the command will take without executing them.")
-	updateCmd.Flags().StringVarP(&updateFlags.Remote, "remote", "r", "origin", "Name of the git remote to interact with.")
-	updateCmd.Flags().StringVarP(&updateFlags.BaseBranch, "base", "b", "main", "Name of the base branch to target with pull requests.")
 }
 
 type githubConfigFile struct {
@@ -300,11 +282,14 @@ func gitLocalCommits(ctx context.Context, args ...string) ([]*localCommit, error
 	}
 	parts := strings.Split(out, sep)
 
-	p := pool.NewWithResults[*localCommit]().WithErrors()
-
+	type result struct {
+		index  int
+		commit *localCommit
+	}
+	p := pool.NewWithResults[*result]().WithErrors()
 	for i := 0; i < len(parts)-1; i += 2 {
 		i := i
-		p.Go(func() (*localCommit, error) {
+		p.Go(func() (*result, error) {
 			hash := strings.TrimSpace(parts[i])
 			msg := parts[i+1]
 
@@ -312,14 +297,26 @@ func gitLocalCommits(ctx context.Context, args ...string) ([]*localCommit, error
 			if err != nil {
 				return nil, err
 			}
-			return &localCommit{
-				Hash:          hash,
-				Message:       msg,
-				StackCommitID: stackCommitID,
+			return &result{
+				index: i / 2,
+				commit: &localCommit{
+					Hash:          hash,
+					Message:       msg,
+					StackCommitID: stackCommitID,
+				},
 			}, nil
 		})
 	}
-	return p.Wait()
+	results, err := p.Wait()
+	if err != nil {
+		return nil, err
+	}
+	commits := make([]*localCommit, len(results))
+	for _, r := range results {
+		commits[r.index] = r.commit
+	}
+	return commits, nil
+
 }
 
 type localCommit struct {
@@ -508,7 +505,89 @@ func gitForcePushCommits(
 	return err
 }
 
-var prTemplate = template.Must(template.New("foo").Parse(`{{.Body}}
+func githubCreateAndEditPRs(
+	ctx context.Context,
+	gh *github.Client,
+	remote string,
+	owner string,
+	repo string,
+	localCommits []*localCommit,
+	prs map[string]*github.PullRequest,
+	dispatch func(string, func() error) error,
+) error {
+	ctx, task := trace.NewTask(ctx, "githubCreateAndEditPRs")
+	defer task.End()
+
+	p := pool.New().WithMaxGoroutines(10).WithErrors()
+	for i, commit := range localCommits {
+		commit := commit
+		prBase := updateFlags.BaseBranch
+		if i+1 < len(localCommits) {
+			prBase = stackCommitIDBranch(localCommits[i+1].StackCommitID)
+		}
+
+		prTitle := commit.Oneline()
+		buf := &bytes.Buffer{}
+		if err := prTemplate.Execute(buf, &commit); err != nil {
+			return err
+		}
+		prBody := buf.String()
+		prHead := stackCommitIDBranch(commit.StackCommitID)
+
+		pr, ok := prs[commit.Hash]
+		_ = pr
+		if !ok {
+			dispatch(
+				fmt.Sprintf("create PR for commit %s against %s branch %s", commit.Hash, remote, prBase),
+				func() error {
+					p.Go(func() error {
+						ctx, task := trace.NewTask(ctx, "createPR")
+						defer task.End()
+
+						newPR := &github.NewPullRequest{
+							Title: github.String(prTitle),
+							Head:  github.String(prHead),
+							Base:  github.String(prBase),
+							Body:  github.String(prBody),
+						}
+						_, _, err := gh.PullRequests.Create(ctx, owner, repo, newPR)
+						if err != nil {
+							return fmt.Errorf("create PR: %w", err)
+						}
+						return nil
+					})
+					return nil
+				},
+			)
+		} else if pr.Head.GetSHA() != commit.Hash ||
+			pr.GetTitle() != prTitle ||
+			pr.GetBody() != prBody ||
+			pr.GetBase().GetRef() != prBase {
+			dispatch(
+				fmt.Sprintf("edit PR for commit %s", shortHash(commit.Hash)),
+				func() error {
+					p.Go(func() error {
+						ctx, task := trace.NewTask(ctx, "editPR")
+						defer task.End()
+
+						pr.Title = &prTitle
+						pr.Body = &prBody
+						pr.Base.Ref = &prBase
+						_, _, err := gh.PullRequests.Edit(ctx, owner, repo, pr.GetNumber(), pr)
+						if err != nil {
+							return fmt.Errorf("edit PR: %w", err)
+						}
+						return nil
+					})
+					return nil
+				},
+			)
+		}
+	}
+	return p.Wait()
+}
+
+var prTemplate = template.Must(template.New("foo").Parse(`{{.Message}}
 
 ---
 
