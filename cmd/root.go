@@ -112,38 +112,38 @@ func Execute() {
 	pushCmd.Flags().BoolVarP(&pushFlags.DryRun, "dry-run", "n", false, "show steps without executing them")
 	pushCmd.Flags().StringVarP(&pushFlags.Base, "base", "b", "main", "base branch to target with pull requests")
 	rootCmd.AddCommand(pushCmd)
-	rootCmd.ParseFlags(os.Args)
 
-	if rootFlags.Config != "" {
-		viper.SetConfigFile(rootFlags.Config)
-		cobra.CheckErr(viper.ReadInConfig())
-		if rootFlags.Verbose {
-			rootCmd.Printf("loaded config %q\n", rootFlags.Config)
+	cobra.OnInitialize(func() {
+		if rootFlags.Config != "" {
+			viper.SetConfigFile(rootFlags.Config)
+			cobra.CheckErr(viper.ReadInConfig())
+			if rootFlags.Verbose {
+				rootCmd.Printf("loaded config %q\n", rootFlags.Config)
+			}
+		} else {
+			home, err := os.UserHomeDir()
+			cobra.CheckErr(err)
+			wd, err := os.Getwd()
+			cobra.CheckErr(err)
+			for i, dir := range []string{home, wd} {
+				configFile := filepath.Join(dir, ".gh-stack.yaml")
+				viper.SetConfigFile(configFile)
+				var err error
+				if i == 0 {
+					err = viper.ReadInConfig()
+				} else {
+					err = viper.MergeInConfig()
+				}
+				if err == nil && rootFlags.Verbose {
+					rootCmd.Printf("loaded config %q\n", configFile)
+				}
+				if err != nil && !os.IsNotExist(err) {
+					cobra.CheckErr(err)
+				}
+			}
 		}
-	} else {
-		home, err := os.UserHomeDir()
-		cobra.CheckErr(err)
-		wd, err := os.Getwd()
-		cobra.CheckErr(err)
-		for i, dir := range []string{home, wd} {
-			configFile := filepath.Join(dir, ".gh-stack.yaml")
-			viper.SetConfigFile(configFile)
-			var err error
-			if i == 0 {
-				err = viper.ReadInConfig()
-			} else {
-				err = viper.MergeInConfig()
-			}
-			if err == nil && rootFlags.Verbose {
-				rootCmd.Printf("loaded config %q\n", configFile)
-			}
-			if err != nil && !os.IsNotExist(err) {
-				cobra.CheckErr(err)
-			}
-		}
-	}
-
-	fixViperQuirk(pushCmd)
+		fixViperQuirk(pushCmd)
+	})
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

@@ -45,19 +45,19 @@ type pushFlags struct {
 // 	// initConfigFlags(updateCmd)
 // }
 
-func runPush(cmd *cobra.Command, _ []string, updateFlags pushFlags) error {
+func runPush(cmd *cobra.Command, _ []string, flags pushFlags) error {
 	ctx := cmd.Context()
-	baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.Base)
+	baseBranch := fmt.Sprintf("%s/%s", flags.Remote, flags.Base)
 	localCommits, err := gitLocalCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
 	if err != nil {
 		return err
 	}
 
 	dispatch := func(msg string, fn func() error) error {
-		if updateFlags.DryRun || updateFlags.Verbose {
+		if flags.DryRun || flags.Verbose {
 			cmd.Println(msg)
 		}
-		if !updateFlags.DryRun {
+		if !flags.DryRun {
 			return fn()
 		}
 		return nil
@@ -68,7 +68,7 @@ func runPush(cmd *cobra.Command, _ []string, updateFlags pushFlags) error {
 		return err
 	}
 
-	remoteURL, err := gitRemoteURL(ctx, updateFlags.Remote)
+	remoteURL, err := gitRemoteURL(ctx, flags.Remote)
 	if err != nil {
 		return err
 	}
@@ -88,16 +88,16 @@ func runPush(cmd *cobra.Command, _ []string, updateFlags pushFlags) error {
 		return err
 	}
 
-	if err := gitForcePushCommits(ctx, updateFlags.Remote, localCommits, prs, dispatch); err != nil {
+	if err := gitForcePushCommits(ctx, flags.Remote, localCommits, prs, dispatch); err != nil {
 		return err
 	}
 
-	prs, err = githubCreatePRs(ctx, gh, updateFlags.Remote, owner, repo, updateFlags.Base, localCommits, prs, dispatch)
+	prs, err = githubCreatePRs(ctx, gh, flags.Remote, owner, repo, flags.Base, localCommits, prs, dispatch)
 	if err != nil {
 		return err
 	}
 
-	if err := githubEditPRs(ctx, gh, owner, repo, updateFlags.Base, localCommits, prs, dispatch); err != nil {
+	if err := githubEditPRs(ctx, gh, owner, repo, flags.Base, localCommits, prs, dispatch); err != nil {
 		return err
 	}
 
