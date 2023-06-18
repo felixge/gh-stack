@@ -9,12 +9,12 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"runtime/trace"
 	"strings"
@@ -28,39 +28,33 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var updateCmd = &cobra.Command{
-	Use:          "update",
-	Short:        "Pushes the local commit stack and creates/updates PRs for it.",
-	Long:         ``,
-	SilenceUsage: true,
-	RunE:         runUpdate,
+type pushFlags struct {
+	DryRun  bool
+	Remote  string
+	Base    string
+	Verbose bool
 }
 
-var updateFlags struct {
-	DryRun     bool
-	Remote     string
-	BaseBranch string
-}
+//
+// func init() {
+// 	fmt.Printf("\"init\": %v\n", "init")
+// 	rootCmd.AddCommand(updateCmd)
+//
+// 	viper.BindPFlag("gitremote", updateCmd.Flags().Lookup("gitremote"))
+// 	// cmd.Flags().StringVarP(&globalFlags.Config.BaseBranch, "base-branch", "b", "main", "base branch to target with pull requests")
+// 	// initConfigFlags(updateCmd)
+// }
 
-func init() {
-	rootCmd.AddCommand(updateCmd)
-	updateCmd.Flags().BoolVarP(&updateFlags.DryRun, "dry-run", "n", false, "Output the steps the command will take without executing them.")
-	updateCmd.Flags().StringVarP(&updateFlags.Remote, "remote", "r", "origin", "Name of the git remote to interact with.")
-	updateCmd.Flags().StringVarP(&updateFlags.BaseBranch, "base", "b", "main", "Name of the base branch to target with pull requests.")
-}
-
-func runUpdate(cmd *cobra.Command, _ []string) error {
-	ctx, task := trace.NewTask(cmd.Context(), "runUpdate")
-	defer task.End()
-
-	baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.BaseBranch)
+func runPush(cmd *cobra.Command, _ []string, updateFlags pushFlags) error {
+	ctx := cmd.Context()
+	baseBranch := fmt.Sprintf("%s/%s", updateFlags.Remote, updateFlags.Base)
 	localCommits, err := gitLocalCommits(ctx, fmt.Sprintf("%s..HEAD", baseBranch))
 	if err != nil {
 		return err
 	}
 
 	dispatch := func(msg string, fn func() error) error {
-		if updateFlags.DryRun || globalFlags.Verbose {
+		if updateFlags.DryRun || updateFlags.Verbose {
 			cmd.Println(msg)
 		}
 		if !updateFlags.DryRun {
@@ -98,71 +92,15 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	if err := githubCreateAndEditPRs(ctx, gh, updateFlags.Remote, owner, repo, localCommits, prs, dispatch); err != nil {
+	prs, err = githubCreatePRs(ctx, gh, updateFlags.Remote, owner, repo, updateFlags.Base, localCommits, prs, dispatch)
+	if err != nil {
 		return err
 	}
 
-	// base := updateFlags.BaseBranch
-	// for i := len(localCommits) - 1; i >= 0; i-- {
-	// 	commit := localCommits[i]
-	// 	pr, ok := prs[commit.Hash]
-	// 	remoteBranch := stackCommitIDBranch(commit.StackCommitID)
-	//
-	//
-	// 	var prData = struct {
-	// 		Title string
-	// 		Body  string
-	// 		Base  string
-	// 		Head  string
-	// 	}{commit.Oneline(), commit.Message, base, remoteBranch}
-	//
-	// 	buf := &bytes.Buffer{}
-	// 	if err := prTemplate.Execute(buf, &prData); err != nil {
-	// 		return err
-	// 	}
-	// 	prData.Body = buf.String()
-	//
-	// 	// Create or update PR if needed
-	// 	if !ok {
-	// 		if err := dispatch(
-	// 			fmt.Sprintf("create PR for commit %s against %s branch %s", commit.Hash, updateFlags.Remote, base),
-	// 			func() error {
-	// 				newPR := &github.NewPullRequest{
-	// 					Title: github.String(prData.Title),
-	// 					Head:  github.String(prData.Head),
-	// 					Base:  github.String(prData.Base),
-	// 					Body:  github.String(prData.Body),
-	// 				}
-	// 				_, _, err := gh.PullRequests.Create(ctx, owner, repo, newPR)
-	// 				if err != nil {
-	// 					return fmt.Errorf("create PR: %w", err)
-	// 				}
-	// 				return nil
-	// 			}); err != nil {
-	// 			return err
-	// 		}
-	// 	} else if pr.Head.GetSHA() != commit.Hash ||
-	// 		pr.GetTitle() != prData.Title ||
-	// 		pr.GetBody() != prData.Body ||
-	// 		pr.GetBase().GetRef() != prData.Base {
-	// 		if err := dispatch(
-	// 			fmt.Sprintf("edit PR for commit %s", shortHash(commit.Hash)),
-	// 			func() error {
-	// 				pr.Title = &prData.Title
-	// 				pr.Body = &prData.Body
-	// 				pr.Base.Ref = &prData.Base
-	// 				_, _, err := gh.PullRequests.Edit(ctx, owner, repo, pr.GetNumber(), pr)
-	// 				if err != nil {
-	// 					return fmt.Errorf("edit PR: %w", err)
-	// 				}
-	// 				return nil
-	// 			}); err != nil {
-	// 			return err
-	// 		}
-	// 	}
-	//
-	// 	base = remoteBranch
-	// }
+	if err := githubEditPRs(ctx, gh, owner, repo, updateFlags.Base, localCommits, prs, dispatch); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -334,17 +272,11 @@ func (c *localCommit) Oneline() string {
 }
 
 func initGitHubClient(ctx context.Context) (*github.Client, error) {
-	home, err := os.UserHomeDir()
+	token, err := guessOAuthToken()
 	if err != nil {
 		return nil, err
 	}
-
-	githubConfig, err := loadGitHubConfig(filepath.Join(home, ".config", "gh", "hosts.yml"))
-	if err != nil {
-		return nil, err
-	}
-
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubConfig.OAuthToken})
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	tc := oauth2.NewClient(ctx, ts)
 	return github.NewClient(tc), nil
 }
@@ -505,42 +437,37 @@ func gitForcePushCommits(
 	return err
 }
 
-func githubCreateAndEditPRs(
+func githubCreatePRs(
 	ctx context.Context,
 	gh *github.Client,
 	remote string,
 	owner string,
 	repo string,
+	baseBranch string,
 	localCommits []*localCommit,
-	prs map[string]*github.PullRequest,
+	existingPRs map[string]*github.PullRequest,
 	dispatch func(string, func() error) error,
-) error {
-	ctx, task := trace.NewTask(ctx, "githubCreateAndEditPRs")
+) (map[string]*github.PullRequest, error) {
+	ctx, task := trace.NewTask(ctx, "githubCreatePRs")
 	defer task.End()
 
-	p := pool.New().WithMaxGoroutines(10).WithErrors()
+	p := pool.NewWithResults[CommitWithPR]().WithMaxGoroutines(10).WithErrors()
 	for i, commit := range localCommits {
 		commit := commit
-		prBase := updateFlags.BaseBranch
+		prBase := baseBranch
 		if i+1 < len(localCommits) {
 			prBase = stackCommitIDBranch(localCommits[i+1].StackCommitID)
 		}
 
 		prTitle := commit.Oneline()
-		buf := &bytes.Buffer{}
-		if err := prTemplate.Execute(buf, &commit); err != nil {
-			return err
-		}
-		prBody := buf.String()
+		prBody := "WIP"
 		prHead := stackCommitIDBranch(commit.StackCommitID)
 
-		pr, ok := prs[commit.Hash]
-		_ = pr
-		if !ok {
+		if _, ok := existingPRs[commit.Hash]; !ok {
 			dispatch(
 				fmt.Sprintf("create PR for commit %s against %s branch %s", commit.Hash, remote, prBase),
 				func() error {
-					p.Go(func() error {
+					p.Go(func() (CommitWithPR, error) {
 						ctx, task := trace.NewTask(ctx, "createPR")
 						defer task.End()
 
@@ -550,23 +477,89 @@ func githubCreateAndEditPRs(
 							Base:  github.String(prBase),
 							Body:  github.String(prBody),
 						}
-						_, _, err := gh.PullRequests.Create(ctx, owner, repo, newPR)
-						if err != nil {
-							return fmt.Errorf("create PR: %w", err)
-						}
-						return nil
+						pr, _, err := gh.PullRequests.Create(ctx, owner, repo, newPR)
+						return CommitWithPR{Commit: commit, PR: pr}, err
 					})
 					return nil
 				},
 			)
-		} else if pr.Head.GetSHA() != commit.Hash ||
+		}
+	}
+
+	results, err := p.Wait()
+	if err != nil {
+		return nil, err
+	}
+	combinedPRs := make(map[string]*github.PullRequest)
+	for k, pr := range existingPRs {
+		combinedPRs[k] = pr
+	}
+	for _, result := range results {
+		combinedPRs[result.Commit.Hash] = result.PR
+	}
+	return combinedPRs, nil
+}
+
+func githubEditPRs(
+	ctx context.Context,
+	gh *github.Client,
+	owner string,
+	repo string,
+	baseBranch string,
+	localCommits []*localCommit,
+	prs map[string]*github.PullRequest,
+	dispatch func(string, func() error) error,
+) error {
+	ctx, task := trace.NewTask(ctx, "githubCreateAndEditPRs")
+	defer task.End()
+
+	var pullRequests []*github.PullRequest
+	for _, commit := range localCommits {
+		if pr, ok := prs[commit.Hash]; ok {
+			pullRequests = append(pullRequests, pr)
+		}
+	}
+
+	p := pool.New().WithMaxGoroutines(10).WithErrors()
+	for i, commit := range localCommits {
+		commit := commit
+		prBase := baseBranch
+		if i+1 < len(localCommits) {
+			prBase = stackCommitIDBranch(localCommits[i+1].StackCommitID)
+		}
+
+		prTitle := commit.Oneline()
+		buf := &bytes.Buffer{}
+		if err := prTemplate.Execute(buf, map[string]interface{}{
+			"Commit":       commit,
+			"PullRequests": pullRequests,
+		}); err != nil {
+			return err
+		}
+		prBody := buf.String()
+		// prHead := stackCommitIDBranch(commit.StackCommitID)
+
+		pr, ok := prs[commit.Hash]
+		if !ok || pr.Head.GetSHA() != commit.Hash ||
 			pr.GetTitle() != prTitle ||
 			pr.GetBody() != prBody ||
 			pr.GetBase().GetRef() != prBase {
+
+			prNumber := ""
+			if ok {
+				prNumber = fmt.Sprintf(" #%d", pr.GetNumber())
+			}
+
 			dispatch(
-				fmt.Sprintf("edit PR for commit %s", shortHash(commit.Hash)),
+				fmt.Sprintf("edit PR%s for commit %s", prNumber, shortHash(commit.Hash)),
 				func() error {
 					p.Go(func() error {
+						if !ok {
+							// ok should only be false if we're in --dry-run mode. If we get
+							// this far otherwise, something is very broken.
+							return fmt.Errorf("bug: could not find PR for commit %s", commit.Hash)
+						}
+
 						ctx, task := trace.NewTask(ctx, "editPR")
 						defer task.End()
 
@@ -587,10 +580,75 @@ func githubCreateAndEditPRs(
 	return p.Wait()
 }
 
-var prTemplate = template.Must(template.New("foo").Parse(`{{.Message}}
+var prTemplate = template.Must(template.New("foo").Parse(`{{.Commit.Message}}
 
 ---
+
+Stack:
+
+{{range .PullRequests}}* #{{.GetNumber}} {{if eq .Head.GetSHA $.Commit.Hash}} ⬅{{end}}
+{{end}}
 
 
 This stacked PR was created using [gh-stack](https://github.com/felixge/gh-stack).
 `))
+
+type CommitWithPR struct {
+	Commit *localCommit
+	PR     *github.PullRequest
+}
+
+var errPRNotFound = errors.New("pull request not found")
+
+func githubFindPullRequests(
+	ctx context.Context,
+	gh *github.Client,
+	owner string,
+	repo string,
+	commits []*localCommit) (map[string]*github.PullRequest, error) {
+	ctx, task := trace.NewTask(ctx, "githubFindPullRequests")
+	defer task.End()
+
+	p := pool.NewWithResults[CommitWithPR]().WithMaxGoroutines(10).WithErrors()
+	for _, commit := range commits {
+		commit := commit
+		p.Go(func() (CommitWithPR, error) {
+			remoteBranch := stackCommitIDBranch(commit.StackCommitID)
+			pr, err := findOpenPR(ctx, gh, owner, repo, remoteBranch)
+			if err == errPRNotFound {
+				err = nil
+			}
+			return CommitWithPR{PR: pr, Commit: commit}, err
+		})
+	}
+	results, err := p.Wait()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]*github.PullRequest)
+	for _, result := range results {
+		if result.PR != nil {
+			m[result.Commit.Hash] = result.PR
+		}
+	}
+	return m, nil
+}
+
+func findOpenPR(ctx context.Context, gh *github.Client, owner, repo, head string) (*github.PullRequest, error) {
+	ctx, task := trace.NewTask(ctx, "findOpenPR")
+	defer task.End()
+
+	pulls, _, err := gh.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
+		State: "open",
+		Head:  fmt.Sprintf("%s:%s", owner, head),
+	})
+	if err != nil {
+		// Handle error
+		return nil, fmt.Errorf("list PRs: %w", err)
+	} else if len(pulls) == 0 {
+		return nil, errPRNotFound
+	} else if len(pulls) > 1 {
+		return nil, fmt.Errorf("found more than one PR")
+	}
+	return pulls[0], nil
+}

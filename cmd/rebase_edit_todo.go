@@ -11,29 +11,20 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// rebaseEditTodoCmd represents the rebaseEditTodo command
-var rebaseEditTodoCmd = &cobra.Command{
-	Use:    "rebase-edit-todo",
-	Hidden: true,
-	RunE: func(_ *cobra.Command, args []string) error {
-		if len(args) != 2 {
-			return fmt.Errorf("expected 2 args, but got: %d", len(args))
-		}
-		commitFile, todoFile := args[0], args[1]
+func runRebaseEditTodo(_ *cobra.Command, args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("expected 2 args, but got: %d", len(args))
+	}
+	commitFile, todoFile := args[0], args[1]
 
-		// Load commits that should be reworded from commits file.
-		commits, err := loadCommits(commitFile)
-		if err != nil {
-			return err
-		}
+	// Load commits that should be reworded from commits file.
+	commits, err := loadCommits(commitFile)
+	if err != nil {
+		return err
+	}
 
-		// Update rebase todo to pick those commits for rewording.
-		return editToRewordCommits(todoFile, commits)
-	},
-}
-
-func init() {
-	rootCmd.AddCommand(rebaseEditTodoCmd)
+	// Update rebase todo to pick those commits for rewording.
+	return editToRewordCommits(todoFile, commits)
 }
 
 func loadCommits(commitFile string) ([]string, error) {
